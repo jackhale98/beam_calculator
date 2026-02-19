@@ -8,7 +8,7 @@ A Python tool for analyzing statically indeterminate continuous beams using the 
 
 ## Features
 
-- **Any number of supports** at arbitrary positions — pinned, roller, or fixed
+- **Any number of supports** at arbitrary positions — pinned, roller, fixed, or elastic (beam/spring)
 - **Mixed loading** — point loads, distributed loads (uniform or trapezoidal), and applied moments, in any combination
 - **Imperial or metric** unit systems
 - **Six output diagrams** — shear force, bending moment, slope, deflection, average shear stress, and bending stress
@@ -105,8 +105,25 @@ supports = [
 | `"pinned"` | Restrained | Free | One per beam (prevents horizontal drift) |
 | `"roller"` | Restrained | Free | Additional interior/end supports |
 | `"fixed"` | Restrained | Restrained | Cantilever root, wall embedment |
+| `"beam"` | Elastic (spring) | Free | Flexible supports, elastic foundations |
 
-**Stability requirement:** The beam must have enough supports to prevent rigid-body motion. Typically this means at least one pinned support plus additional rollers, or at least one fixed support.
+#### Beam (Spring) Supports
+
+A `"beam"` support models an elastic/spring support with finite stiffness. Unlike pinned or roller supports which enforce zero displacement, a beam support allows the beam to deflect at that location. The reaction force is proportional to the displacement: `R = k * delta`.
+
+The `stiffness` parameter (in force per unit displacement, e.g. lb/in or N/mm) is required for beam supports and must be positive.
+
+```python
+supports = [
+    Support(position=0.0,   kind="pinned"),
+    Support(position=60.0,  kind="beam", stiffness=5000.0),  # 5000 lb/in spring
+    Support(position=120.0, kind="roller"),
+]
+```
+
+The solver adds the spring stiffness to the global stiffness matrix and solves for the displacement simultaneously with all other DOFs. This means the deflection at the beam support accounts for the beam's own bending stiffness, the spring stiffness, all applied loads, and all other supports — not just a simple `F/k` calculation.
+
+**Stability requirement:** The beam must have enough supports to prevent rigid-body motion. Typically this means at least one pinned support plus additional rollers, or at least one fixed support. Beam (spring) supports alone do not prevent rigid-body motion — they must be combined with at least one pinned or fixed support.
 
 ### Point Loads
 
@@ -188,6 +205,15 @@ The `n_elements` parameter controls mesh density. Higher values give smoother pl
   x =    36.0000 in  (roller)
       Vertical reaction:     475.7812 lb  (↑)
   ...
+```
+
+For beams with elastic (spring) supports, the output also includes the displacement at each beam support:
+
+```
+  x =    60.0000 in  (beam)
+      Vertical reaction:     115.3125 lb  (↑)
+      Displacement:           -0.0231 in  (↓)
+  ...
 
   Sum of vertical reactions: 800.0000 lb
   Total applied load:       800.0000 lb (downward)
@@ -207,7 +233,7 @@ The **equilibrium check** shows the difference between the sum of reactions and 
 The plot is saved to the specified path (default: `beam_analysis.png`) and contains:
 
 1. **Beam Schematic** — free body diagram with:
-   - Support symbols (triangle for pinned, triangle + circle for roller, hatched block for fixed)
+   - Support symbols (triangle for pinned, triangle + circle for roller, hatched block for fixed, zigzag spring for beam supports)
    - Reaction forces with magnitude and direction (green ↑ for upward, orange ↓ for downward/uplift)
    - Applied loads with magnitudes and positions (red for point loads, blue for distributed, green for moments)
 
@@ -217,7 +243,7 @@ The plot is saved to the specified path (default: `beam_analysis.png`) and conta
 
 4. **Slope Diagram** — rotation angle θ of the beam cross-section (in radians). This is the first derivative of the deflection curve.
 
-5. **Deflection Diagram** — vertical displacement δ of the beam (in length units). Negative = downward. Zero at support locations.
+5. **Deflection Diagram** — vertical displacement δ of the beam (in length units). Negative = downward. Zero at pinned/roller/fixed support locations; non-zero at beam (spring) supports.
 
 6. **Average Shear Stress Diagram** — τ = V / A (in stress units). Same shape as the shear force diagram, scaled by cross-sectional area. Note: actual maximum shear stress is higher (1.5× for rectangular sections; varies for other shapes).
 
@@ -240,7 +266,7 @@ solver = ContinuousBeamSolver(
     section=BeamSection(E=29e6, I=30.8, A=2.96, c=3.94),
     supports=[
         Support(0, "pinned"),
-        Support(60, "roller"),
+        Support(60, "beam", stiffness=5000.0),   # elastic spring support
         Support(120, "roller"),
     ],
     distributed_loads=[
@@ -251,7 +277,7 @@ solver = ContinuousBeamSolver(
 solver.solve()
 
 # Access results directly
-print(solver.reactions)          # dict of {position: {vertical, moment}}
+print(solver.reactions)          # dict of {position: {vertical, moment, displacement*}}
 print(solver.V_plot)             # shear force array
 print(solver.M_plot)             # bending moment array
 print(solver.delta_plot)         # deflection array
@@ -259,6 +285,7 @@ print(solver.theta_plot)         # slope array
 print(solver.tau_plot)           # average shear stress array
 print(solver.sigma_plot)         # bending stress array
 print(solver.x_plot)             # x-coordinate array for all plots
+# * 'displacement' key is only present for beam (spring) supports
 
 solver.plot(save_path="my_beam.png")   # save plot to file
 solver.plot()                          # display interactively
@@ -274,6 +301,7 @@ solver.plot()                          # display interactively
 | Distributed load intensity | Downward ↓ |
 | Applied moment magnitude | Counterclockwise ↺ |
 | Reaction (vertical) | Upward ↑ |
+| Reaction (beam support) | Upward ↑ (R = k × δ, opposing displacement) |
 | Reaction (moment, fixed) | Counterclockwise ↺ |
 | Bending moment | Sagging (tension on bottom) |
 | Deflection | Upward ↑ |
@@ -291,9 +319,9 @@ The solver uses the **direct stiffness method** with Euler-Bernoulli beam elemen
 1. The beam is meshed into elements with nodes placed at all support, load, and endpoint locations.
 2. Element stiffness matrices (4×4) are assembled into a global system.
 3. Equivalent nodal forces are computed for distributed loads.
-4. Boundary conditions are applied by constraining DOFs at support locations.
+4. Boundary conditions are applied by constraining DOFs at support locations. For beam (spring) supports, the spring stiffness is added to the diagonal of the global stiffness matrix instead of constraining the DOF, so the displacement is solved for rather than prescribed as zero.
 5. The reduced system Kf · Uf = Ff is solved for unknown displacements.
-6. Reactions are recovered from R = K · U - F.
+6. Reactions are recovered from R = K · U - F for rigid supports. For beam supports, the reaction is R = -k · δ (spring force opposing the displacement).
 
 **Post-processing:**
 - Deflection and slope are read directly from the solution vector.
@@ -323,6 +351,8 @@ The solver uses the **direct stiffness method** with Euler-Bernoulli beam elemen
 | Reactions don't match hand calculations | Check sign conventions | Positive loads = downward; positive moments = CCW |
 | Plot looks jagged | Mesh too coarse | Increase `n_elements` to 800+ |
 | Very large deflections | Units mismatch | Verify E, I, and length are in consistent units |
+| "requires a positive stiffness value" | Beam support missing stiffness | Add `stiffness=<value>` to the `Support(kind="beam", ...)` |
+| Beam support deflection too large | Spring stiffness too low | Increase the `stiffness` value or check units (lb/in vs N/mm) |
 
 ---
 

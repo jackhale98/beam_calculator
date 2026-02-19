@@ -6,7 +6,7 @@ Solves statically indeterminate continuous beams using the
 direct stiffness (finite element) method with Euler-Bernoulli beam theory.
 
 Supports:
-  - Multiple support types: pinned, roller, fixed
+  - Multiple support types: pinned, roller, fixed, beam (spring/elastic)
   - Load types: point loads, distributed loads (uniform/trapezoidal), moments
   - Metric or Imperial unit systems
   - Output: reactions, shear, moment, slope, deflection, shear stress, bending stress
@@ -30,13 +30,19 @@ from typing import List, Dict, Tuple, Optional
 class Support:
     """
     Beam support definition.
-    position : distance from left end of beam
-    kind     : 'pinned', 'roller', or 'fixed'
-               (pinned and roller both restrain vertical displacement;
-                fixed also restrains rotation)
+    position  : distance from left end of beam
+    kind      : 'pinned', 'roller', 'fixed', or 'beam'
+                (pinned and roller both restrain vertical displacement;
+                 fixed also restrains rotation;
+                 beam provides elastic support with finite stiffness —
+                 displacement and reaction force are solved for)
+    stiffness : spring stiffness for 'beam' supports (force per unit
+                displacement, e.g. lb/in or N/mm). Required when
+                kind='beam', ignored otherwise.
     """
     position: float
-    kind: str = "pinned"  # 'pinned', 'roller', 'fixed'
+    kind: str = "pinned"  # 'pinned', 'roller', 'fixed', 'beam'
+    stiffness: Optional[float] = None
 
 
 @dataclass
@@ -263,9 +269,20 @@ class ContinuousBeamSolver:
         for s in self.supports:
             idx = np.argmin(np.abs(nodes - s.position))
             support_node_indices[s.position] = idx
-            constrained_dofs.append(2 * idx)  # v = 0
-            if s.kind == "fixed":
-                constrained_dofs.append(2 * idx + 1)  # theta = 0
+            if s.kind == "beam":
+                # Beam (spring) support: add spring stiffness to the
+                # diagonal of the global stiffness matrix.  The DOF
+                # remains free so we solve for the displacement.
+                if s.stiffness is None or s.stiffness <= 0:
+                    raise ValueError(
+                        f"Beam support at x={s.position} requires a "
+                        f"positive stiffness value."
+                    )
+                K[2 * idx, 2 * idx] += s.stiffness
+            else:
+                constrained_dofs.append(2 * idx)  # v = 0
+                if s.kind == "fixed":
+                    constrained_dofs.append(2 * idx + 1)  # theta = 0
 
         constrained_dofs = sorted(set(constrained_dofs))
         free_dofs = [i for i in range(n_dof) if i not in constrained_dofs]
@@ -288,9 +305,22 @@ class ContinuousBeamSolver:
         reactions = {}
         for s in self.supports:
             idx = support_node_indices[s.position]
-            vert = R[2 * idx]
-            mom = R[2 * idx + 1] if s.kind == "fixed" else 0.0
-            reactions[s.position] = {"vertical": vert, "moment": mom}
+            if s.kind == "beam":
+                # For beam (spring) supports the reaction force is the
+                # force the spring exerts *on the beam*.  When the beam
+                # deflects downward (v < 0) the spring pushes upward,
+                # so the reaction is  R = -k·v  (positive = upward).
+                disp = U[2 * idx]
+                vert = -s.stiffness * disp
+                reactions[s.position] = {
+                    "vertical": vert,
+                    "moment": 0.0,
+                    "displacement": disp,
+                }
+            else:
+                vert = R[2 * idx]
+                mom = R[2 * idx + 1] if s.kind == "fixed" else 0.0
+                reactions[s.position] = {"vertical": vert, "moment": mom}
 
         # ── Store raw results ──
         self.nodes = nodes
@@ -430,6 +460,9 @@ class ContinuousBeamSolver:
             print(f"      Vertical reaction: {v:12.4f} {f_unit}  ({'↑' if v > 0 else '↓'})")
             if abs(m) > 1e-10:
                 print(f"      Moment reaction:   {m:12.4f} {m_unit}  ({'↺' if m > 0 else '↻'})")
+            if "displacement" in r:
+                disp = r["displacement"]
+                print(f"      Displacement:      {disp:12.6f} {d_unit}  ({'↑' if disp > 0 else '↓'})")
 
         print(f"\n  Sum of vertical reactions: {total_v:.4f} {f_unit}")
 
@@ -553,6 +586,32 @@ class ContinuousBeamSolver:
                     )
                 support_bottom = -1.8
                 label_base_y = -2.5
+            elif s.kind == "beam":
+                # Beam (spring) support: zigzag spring symbol
+                spring_w = beam_len * 0.015  # half-width of zigzag
+                spring_top = 0.0
+                spring_bot = -1.8
+                n_coils = 5
+                # Build zigzag path
+                spring_pts_y = np.linspace(spring_top, spring_bot, 2 * n_coils + 3)
+                spring_pts_x = [sx]  # start at beam
+                for j in range(1, len(spring_pts_y) - 1):
+                    spring_pts_x.append(
+                        sx + spring_w * (1 if j % 2 == 1 else -1)
+                    )
+                spring_pts_x.append(sx)  # end centred
+                ax_beam.plot(
+                    spring_pts_x, spring_pts_y,
+                    color="black", linewidth=1.4, zorder=4,
+                )
+                # Ground line at bottom
+                ax_beam.plot(
+                    [sx - spring_w * 1.5, sx + spring_w * 1.5],
+                    [spring_bot, spring_bot],
+                    color="black", linewidth=1.2, zorder=4,
+                )
+                support_bottom = spring_bot
+                label_base_y = -2.5
             elif s.kind == "roller":
                 # Roller: triangle + circle below
                 tri_h = 1.2
@@ -605,6 +664,10 @@ class ContinuousBeamSolver:
             if s.kind == "fixed" and abs(rm) > 1e-10:
                 m_dir = "↺" if rm > 0 else "↻"
                 label_parts.append(f"M = {rm:.2f} {m_unit} {m_dir}")
+            if s.kind == "beam" and "displacement" in r:
+                disp = r["displacement"]
+                d_dir = "↑" if disp > 0 else "↓"
+                label_parts.append(f"δ = {disp:.4g} {d_unit} {d_dir}")
 
             ax_beam.text(
                 sx, arrow_bot - 0.3,
@@ -771,9 +834,11 @@ def example_four_support_beam():
     )
 
     # ── Supports ──
-    # Types: 'pinned', 'roller', 'fixed'
+    # Types: 'pinned', 'roller', 'fixed', 'beam'
     # Pinned and roller both prevent vertical displacement.
     # Fixed also prevents rotation.
+    # Beam provides elastic (spring) support — requires stiffness parameter.
+    #   The solver computes both the displacement and reaction force.
     # NOTE: You need at least enough supports to prevent rigid-body motion.
     #        Typically: one pinned + rollers, or one fixed end, etc.
     supports = [
@@ -861,6 +926,52 @@ def example_metric_beam():
     return solver
 
 
+def example_beam_support():
+    """
+    Example: Beam with an elastic (beam/spring) support.
+
+    A simply-supported beam has an additional beam support at mid-span
+    with finite stiffness.  The solver computes the displacement at
+    the beam support and the resulting reaction force (R = k * δ).
+
+    Uses IMPERIAL units.
+    """
+    beam_length = 120.0  # inches (10 feet)
+
+    section = BeamSection(
+        E=29_000_000.0,  # psi (steel)
+        I=30.8,          # in^4
+        A=2.96,          # in^2
+        c=3.94,          # in
+    )
+
+    supports = [
+        Support(position=0.0,   kind="pinned"),
+        Support(position=60.0,  kind="beam", stiffness=5000.0),  # 5000 lb/in spring
+        Support(position=120.0, kind="roller"),
+    ]
+
+    point_loads = [
+        PointLoad(position=30.0, magnitude=500.0),   # 500 lb at quarter-span
+        PointLoad(position=90.0, magnitude=500.0),   # 500 lb at three-quarter span
+    ]
+
+    solver = ContinuousBeamSolver(
+        length=beam_length,
+        section=section,
+        supports=supports,
+        point_loads=point_loads,
+        unit_system="imperial",
+        n_elements=800,
+    )
+
+    solver.solve()
+    solver.print_results()
+    solver.plot(save_path="beam_analysis_spring.png")
+
+    return solver
+
+
 # ─────────────────────────────────────────────────────────────
 # MAIN — Run the example
 # ─────────────────────────────────────────────────────────────
@@ -873,3 +984,6 @@ if __name__ == "__main__":
 
     # Uncomment the line below to also run the metric example:
     # solver_metric = example_metric_beam()
+
+    # Uncomment the line below to run the beam (spring) support example:
+    # solver_spring = example_beam_support()
