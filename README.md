@@ -33,7 +33,7 @@ pip install numpy matplotlib
 
 ## Quick Start
 
-1. Open `beam_solver.py` and edit the configuration in the `example_four_support_beam()` function at the bottom of the file.
+1. Open `beam_solver.py` and edit the configuration in one of the example functions at the bottom of the file.
 2. Run:
 
 ```bash
@@ -41,6 +41,25 @@ python beam_solver.py
 ```
 
 3. View the console output for reactions and extreme values, and the saved `beam_analysis.png` for diagrams.
+
+By default, the script runs `example_four_support_beam()`. To run a different example, uncomment the corresponding line in the `if __name__ == "__main__"` block:
+
+```python
+if __name__ == "__main__":
+    solver = example_four_support_beam()       # 4-support beam with UDL (imperial)
+
+    # Uncomment the line below to also run the metric example:
+    # solver_metric = example_metric_beam()
+
+    # Uncomment the line below to run the beam (spring) support example:
+    # solver_spring = example_beam_support()
+```
+
+| Example | Description |
+|---------|-------------|
+| `example_four_support_beam()` | Four-support continuous beam with a centered uniform distributed load (imperial units) |
+| `example_metric_beam()` | Beam analysis using metric units (N, mm, MPa) |
+| `example_beam_support()` | Beam with an elastic spring support at mid-span (`kind="beam"`, `stiffness=5000 lb/in`) |
 
 ---
 
