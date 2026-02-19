@@ -11,7 +11,9 @@ A Python tool for analyzing statically indeterminate continuous beams using the 
 - **Any number of supports** at arbitrary positions — pinned, roller, fixed, or elastic (beam/spring)
 - **Mixed loading** — point loads, distributed loads (uniform or trapezoidal), and applied moments, in any combination
 - **Imperial or metric** unit systems
-- **Six output diagrams** — shear force, bending moment, slope, deflection, average shear stress, and bending stress
+- **Automatic self-weight** — optional beam weight per unit length is automatically included as a uniform distributed load
+- **Maximum shear stress** — reports both average (V/A) and maximum shear stress using a configurable cross-section shape factor
+- **Seven output diagrams** — shear force, bending moment, slope, deflection, average shear stress, maximum shear stress, and bending stress
 - **Annotated beam schematic** — a free body diagram showing all applied loads with positions, support types, and calculated reaction forces with direction arrows
 - **Console output** — tabulated reactions, equilibrium check, and extreme values
 
@@ -86,19 +88,48 @@ beam_length = 120.0  # total span in inches (or mm for metric)
 
 ```python
 section = BeamSection(
-    E=29_000_000.0,  # modulus of elasticity (psi or MPa)
-    I=30.8,          # moment of inertia (in⁴ or mm⁴)
-    A=2.96,          # cross-sectional area (in² or mm²)
-    c=3.94,          # distance from neutral axis to extreme fiber (in or mm)
+    E=29_000_000.0,       # modulus of elasticity (psi or MPa)
+    I=30.8,               # moment of inertia (in⁴ or mm⁴)
+    A=2.96,               # cross-sectional area (in² or mm²)
+    c=3.94,               # distance from neutral axis to extreme fiber (in or mm)
+    weight_per_length=0.833,  # self-weight per unit length (lb/in or N/mm), default 0
+    shear_shape_factor=1.5,   # multiplier for max shear stress (default 1.5)
 )
 ```
 
-| Property | Description | Imperial | Metric |
-|----------|-------------|----------|--------|
-| `E` | Modulus of elasticity | psi | MPa |
-| `I` | Second moment of area | in⁴ | mm⁴ |
-| `A` | Cross-sectional area | in² | mm² |
-| `c` | Extreme fiber distance | in | mm |
+| Property | Description | Imperial | Metric | Default |
+|----------|-------------|----------|--------|---------|
+| `E` | Modulus of elasticity | psi | MPa | — |
+| `I` | Second moment of area | in⁴ | mm⁴ | — |
+| `A` | Cross-sectional area | in² | mm² | — |
+| `c` | Extreme fiber distance | in | mm | — |
+| `weight_per_length` | Beam self-weight per unit length | lb/in | N/mm | 0 |
+| `shear_shape_factor` | Max-to-average shear stress ratio | — | — | 1.5 |
+
+#### Self-Weight
+
+If `weight_per_length` is set to a value greater than zero, the solver automatically adds a full-span uniform downward distributed load equal to the beam's self-weight. This load participates in the analysis alongside all other applied loads and is included in the equilibrium check.
+
+```python
+# W8x10 steel beam weighs 10 lb/ft = 0.833 lb/in
+section = BeamSection(E=29e6, I=30.8, A=2.96, c=3.94, weight_per_length=0.833)
+```
+
+To omit self-weight (the default), either leave the parameter out or set it to `0`.
+
+#### Shear Shape Factor
+
+The average shear stress `V/A` underestimates the actual maximum shear stress at the neutral axis. The `shear_shape_factor` converts average to maximum: `τ_max = shear_shape_factor × V/A`.
+
+| Cross-Section | Shape Factor |
+|---------------|-------------|
+| Rectangular | 1.5 |
+| Solid circular | 4/3 ≈ 1.333 |
+| Thin-walled circular | 2.0 |
+| Wide-flange (I-beam) | ≈ A / (d × t_w) |
+| Aluminum extrusion (e.g. 80/20) | ≈ A / (d × t_w_min) — use the thinnest web |
+
+For complex profiles like 80/20 T-slot extrusions, check the manufacturer's data sheet for section properties and minimum web thickness, then compute the factor as `A / (depth × min_web_thickness)`.
 
 **Common material values:**
 
@@ -264,9 +295,11 @@ The plot is saved to the specified path (default: `beam_analysis.png`) and conta
 
 5. **Deflection Diagram** — vertical displacement δ of the beam (in length units). Negative = downward. Zero at pinned/roller/fixed support locations; non-zero at beam (spring) supports.
 
-6. **Average Shear Stress Diagram** — τ = V / A (in stress units). Same shape as the shear force diagram, scaled by cross-sectional area. Note: actual maximum shear stress is higher (1.5× for rectangular sections; varies for other shapes).
+6. **Average Shear Stress Diagram** — τ_avg = V / A (in stress units). Same shape as the shear force diagram, scaled by cross-sectional area.
 
-7. **Bending Stress Diagram** — σ = M·c / I (in stress units). Maximum fiber stress at the extreme fiber of the cross-section. Compare this to the material's allowable bending stress.
+7. **Maximum Shear Stress Diagram** — τ_max = shear_shape_factor × V / A (in stress units). The actual peak shear stress at the neutral axis, accounting for cross-section shape. Compare this to the material's allowable shear stress.
+
+8. **Bending Stress Diagram** — σ = M·c / I (in stress units). Maximum fiber stress at the extreme fiber of the cross-section. Compare this to the material's allowable bending stress.
 
 ---
 
@@ -301,7 +334,8 @@ print(solver.V_plot)             # shear force array
 print(solver.M_plot)             # bending moment array
 print(solver.delta_plot)         # deflection array
 print(solver.theta_plot)         # slope array
-print(solver.tau_plot)           # average shear stress array
+print(solver.tau_avg_plot)       # average shear stress array
+print(solver.tau_max_plot)       # maximum shear stress array (shape-factor adjusted)
 print(solver.sigma_plot)         # bending stress array
 print(solver.x_plot)             # x-coordinate array for all plots
 # * 'displacement' key is only present for beam (spring) supports
@@ -346,7 +380,7 @@ The solver uses the **direct stiffness method** with Euler-Bernoulli beam elemen
 - Deflection and slope are read directly from the solution vector.
 - Bending moment is computed from the second derivative of the displacement field: M = EI · v″, evaluated using Hermite shape function derivatives.
 - Shear force is computed from the third derivative: V = EI · v‴ (constant per element).
-- Stresses are computed from the internal forces: σ = M·c/I and τ = V/A.
+- Stresses are computed from the internal forces: σ = M·c/I (max bending stress at extreme fiber), τ_avg = V/A (average shear stress), and τ_max = shear_shape_factor × V/A (maximum shear stress at neutral axis).
 
 ---
 
@@ -355,8 +389,7 @@ The solver uses the **direct stiffness method** with Euler-Bernoulli beam elemen
 - **Euler-Bernoulli theory** — assumes plane sections remain plane and neglects shear deformation. Accurate for slender beams (length/depth > 10). For deep beams, Timoshenko beam theory would be more appropriate.
 - **Prismatic beam** — the cross-section (E, I, A, c) is constant along the entire length. Stepped or tapered beams are not supported.
 - **Linear elastic** — assumes small deflections and linear material behavior. Not suitable for plastic analysis or large-deformation problems.
-- **Average shear stress** — the reported shear stress is V/A, which is a simplification. The actual shear stress distribution depends on the cross-section shape (parabolic for rectangular, concentrated in the web for I-beams).
-- **No self-weight** — the beam's own weight is not automatically included. Add it as a distributed load if needed.
+- **Shear stress approximation** — the maximum shear stress uses a single shape factor applied to V/A. For complex cross-sections (e.g. aluminum extrusions, multi-cell profiles), a more detailed analysis (VQ/It) may be needed. The shape factor approach is conservative for standard shapes.
 - **2D analysis** — vertical loads and in-plane bending only. No lateral-torsional buckling, biaxial bending, or axial loads.
 
 ---

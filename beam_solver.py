@@ -87,15 +87,24 @@ class AppliedMoment:
 class BeamSection:
     """
     Cross-section and material properties.
-    E : modulus of elasticity
-    I : second moment of area (moment of inertia)
-    A : cross-sectional area
-    c : distance from neutral axis to extreme fiber (for bending stress)
+    E                 : modulus of elasticity
+    I                 : second moment of area (moment of inertia)
+    A                 : cross-sectional area
+    c                 : distance from neutral axis to extreme fiber (for bending stress)
+    weight_per_length : beam self-weight per unit length (force/length, e.g. lb/in
+                        or N/mm).  If > 0 the solver automatically adds a uniform
+                        downward distributed load over the full span.  Default 0.
+    shear_shape_factor: multiplier to convert average shear stress (V/A) to maximum
+                        shear stress at the neutral axis.  Depends on cross-section
+                        shape:  1.5 for rectangular, 4/3 for solid circular,
+                        ~A/(d·t_w) for I-beams.  Default 1.5 (rectangular).
     """
     E: float
     I: float
     A: float
     c: float
+    weight_per_length: float = 0.0
+    shear_shape_factor: float = 1.5
 
 
 # ─────────────────────────────────────────────────────────────
@@ -138,7 +147,8 @@ class ContinuousBeamSolver:
         self.M_plot = None
         self.theta_plot = None
         self.delta_plot = None
-        self.tau_plot = None
+        self.tau_avg_plot = None
+        self.tau_max_plot = None
         self.sigma_plot = None
 
     # ── Mesh Generation ──────────────────────────────────────
@@ -181,6 +191,21 @@ class ContinuousBeamSolver:
         n_dof = 2 * n_nodes
         EI = self.section.E * self.section.I
 
+        # ── Self-weight ──
+        # If the section has a weight_per_length, prepend a full-span
+        # uniform distributed load so it participates in the assembly
+        # and in the equilibrium check.
+        if self.section.weight_per_length > 0:
+            self_weight_load = DistributedLoad(
+                start=0.0,
+                end=self.length,
+                w_start=self.section.weight_per_length,
+                w_end=self.section.weight_per_length,
+            )
+            self._all_distributed_loads = [self_weight_load] + list(self.distributed_loads)
+        else:
+            self._all_distributed_loads = list(self.distributed_loads)
+
         # ── Global stiffness matrix and force vector ──
         K = np.zeros((n_dof, n_dof))
         F = np.zeros(n_dof)
@@ -208,7 +233,7 @@ class ContinuousBeamSolver:
                     K[dofs[a], dofs[b]] += k_e[a, b]
 
             # ── Distributed loads (equivalent nodal forces) ──
-            for dl in self.distributed_loads:
+            for dl in self._all_distributed_loads:
                 if x1 <= dl.start + 1e-12 or x0 >= dl.end - 1e-12:
                     continue
 
@@ -336,8 +361,9 @@ class ContinuousBeamSolver:
 
     def _distributed_load_at(self, x: float) -> float:
         """Return the total distributed load intensity at position x (positive downward)."""
+        loads = getattr(self, '_all_distributed_loads', self.distributed_loads)
         w_total = 0.0
-        for dl in self.distributed_loads:
+        for dl in loads:
             if dl.start - 1e-12 <= x <= dl.end + 1e-12:
                 span = dl.end - dl.start
                 if span < 1e-14:
@@ -408,7 +434,8 @@ class ContinuousBeamSolver:
                 V[-1] = (EI / h ** 3) * (12 * v1 + 6 * h * t1 - 12 * v2 + 6 * h * t2)
 
         # ── Stresses ──
-        tau = V / self.section.A  # average shear stress
+        tau_avg = V / self.section.A  # average shear stress
+        tau_max = self.section.shear_shape_factor * tau_avg  # max shear stress at neutral axis
         sigma = M * self.section.c / self.section.I  # max bending stress (at extreme fiber)
 
         # ── Store ──
@@ -417,7 +444,8 @@ class ContinuousBeamSolver:
         self.M_plot = M
         self.theta_plot = theta
         self.delta_plot = delta
-        self.tau_plot = tau
+        self.tau_avg_plot = tau_avg
+        self.tau_max_plot = tau_max
         self.sigma_plot = sigma
 
     # ── Printing ──────────────────────────────────────────────
@@ -466,21 +494,26 @@ class ContinuousBeamSolver:
 
         print(f"\n  Sum of vertical reactions: {total_v:.4f} {f_unit}")
 
-        # Total applied load
+        # Total applied load (including self-weight if present)
         total_load = sum(pl.magnitude for pl in self.point_loads)
-        for dl in self.distributed_loads:
+        loads = getattr(self, '_all_distributed_loads', self.distributed_loads)
+        for dl in loads:
             w_avg = (dl.w_start + dl.w_end) / 2
             total_load += w_avg * (dl.end - dl.start)
         print(f"  Total applied load:       {total_load:.4f} {f_unit} (downward)")
+        if self.section.weight_per_length > 0:
+            sw = self.section.weight_per_length * self.length
+            print(f"    (includes self-weight:  {sw:.4f} {f_unit})")
         print(f"  Equilibrium check:        {abs(total_v - total_load):.6e} {f_unit}")
 
         print("\n── EXTREME VALUES ───────────────────────────────────────")
-        print(f"  Max shear force:     {np.max(np.abs(self.V_plot)):12.4f} {f_unit}")
-        print(f"  Max bending moment:  {np.max(np.abs(self.M_plot)):12.4f} {m_unit}")
-        print(f"  Max deflection:      {np.max(np.abs(self.delta_plot)):12.6f} {d_unit}")
-        print(f"  Max slope:           {np.max(np.abs(self.theta_plot)):12.6e} {ang_unit}")
-        print(f"  Max avg shear stress:{np.max(np.abs(self.tau_plot)):12.4f} {s_unit}")
-        print(f"  Max bending stress:  {np.max(np.abs(self.sigma_plot)):12.4f} {s_unit}")
+        print(f"  Max shear force:      {np.max(np.abs(self.V_plot)):12.4f} {f_unit}")
+        print(f"  Max bending moment:   {np.max(np.abs(self.M_plot)):12.4f} {m_unit}")
+        print(f"  Max deflection:       {np.max(np.abs(self.delta_plot)):12.6f} {d_unit}")
+        print(f"  Max slope:            {np.max(np.abs(self.theta_plot)):12.6e} {ang_unit}")
+        print(f"  Max avg shear stress: {np.max(np.abs(self.tau_avg_plot)):12.4f} {s_unit}")
+        print(f"  Max shear stress:     {np.max(np.abs(self.tau_max_plot)):12.4f} {s_unit}  (shape factor = {self.section.shear_shape_factor})")
+        print(f"  Max bending stress:   {np.max(np.abs(self.sigma_plot)):12.4f} {s_unit}")
         print("=" * 65)
 
     # ── Plotting ──────────────────────────────────────────────
@@ -502,7 +535,7 @@ class ContinuousBeamSolver:
 
         x = self.x_plot
 
-        fig, axes = plt.subplots(6, 1, figsize=(14, 24), sharex=True)
+        fig, axes = plt.subplots(7, 1, figsize=(14, 28), sharex=True)
         fig.suptitle("Continuous Beam Analysis", fontsize=16, fontweight="bold", y=0.995)
 
         # ── Helper: draw beam schematic on each subplot ──
@@ -516,7 +549,8 @@ class ContinuousBeamSolver:
             (self.M_plot, f"Bending Moment ({m_unit})", "firebrick", "Bending Moment Diagram"),
             (self.theta_plot, f"Slope (rad)", "darkorange", "Slope Diagram"),
             (self.delta_plot, f"Deflection ({d_unit})", "seagreen", "Deflection Diagram"),
-            (self.tau_plot, f"Avg Shear Stress ({s_unit})", "mediumpurple", "Average Shear Stress Diagram"),
+            (self.tau_avg_plot, f"Avg Shear Stress ({s_unit})", "mediumpurple", "Average Shear Stress Diagram"),
+            (self.tau_max_plot, f"Max Shear Stress ({s_unit})", "darkorchid", f"Maximum Shear Stress Diagram (shape factor = {self.section.shear_shape_factor})"),
             (self.sigma_plot, f"Bending Stress ({s_unit})", "crimson", "Bending Stress Diagram"),
         ]
 
@@ -548,7 +582,7 @@ class ContinuousBeamSolver:
         axes[-1].set_xlabel(f"Position along beam ({l_unit})", fontsize=11)
 
         # ── Draw beam schematic at the top ──
-        ax_beam = fig.add_axes([0.125, 0.86, 0.775, 0.12])
+        ax_beam = fig.add_axes([0.125, 0.88, 0.775, 0.10])
         beam_len = self.length
         pad = beam_len * 0.03
         ax_beam.set_xlim(x[0] - pad, x[-1] + pad)
@@ -787,7 +821,7 @@ class ContinuousBeamSolver:
                 zorder=6,
             )
 
-        plt.tight_layout(rect=[0, 0, 1, 0.86])
+        plt.tight_layout(rect=[0, 0, 1, 0.88])
 
         if save_path:
             plt.savefig(save_path, dpi=150, bbox_inches="tight")
@@ -826,11 +860,15 @@ def example_four_support_beam():
     #   I = 30.8 in^4
     #   A = 2.96 in^2
     #   c = 3.94 in (half-depth)
+    #   weight = 10 lb/ft = 0.833 lb/in
+    #   shear_shape_factor = 1.5 (rectangular approx; for I-beams use A/(d*t_w))
     section = BeamSection(
-        E=29_000_000.0,  # psi
-        I=30.8,          # in^4
-        A=2.96,          # in^2
-        c=3.94,          # in
+        E=29_000_000.0,       # psi
+        I=30.8,               # in^4
+        A=2.96,               # in^2
+        c=3.94,               # in
+        weight_per_length=0.833,  # lb/in  (W8x10 ≈ 10 lb/ft)
+        shear_shape_factor=1.5,   # rectangular approximation
     )
 
     # ── Supports ──
